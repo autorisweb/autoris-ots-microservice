@@ -5,7 +5,7 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Response
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -15,7 +15,7 @@ PROOFS_DIR.mkdir(parents=True, exist_ok=True)
 
 app = FastAPI(title=f"{APP_NAME}")
 
-# CORS (adjust as needed)
+# CORS (ajusta si hace falta)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -29,29 +29,24 @@ def _sha256_bytes(data: bytes) -> str:
     h.update(data)
     return h.hexdigest()
 
-def _run_ots_verify(ots_path: Path, target_path: Optional[Path] = None) -> dict:
-    """Run `ots verify` and parse output lightly.
-    Returns a dict with {"ok": bool, "stdout": str, "stderr": str}.
-    If `target_path` is provided, includes it so `ots` can pair proof with file.
+def _run_ots_verify(ots_path: Path) -> dict:
+    """
+    Ejecuta `ots verify` SOLO con la prueba .ots.
+    (El archivo original NO se pasa como argumento al CLI.)
     """
     cmd = ["ots", "verify", str(ots_path)]
-    if target_path is not None:
-        cmd.append(str(target_path))
-
     try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
     except FileNotFoundError:
-        raise HTTPException(status_code=500, detail="The `ots` CLI is not installed. Ensure `opentimestamps-client` is in requirements.txt")
+        raise HTTPException(
+            status_code=500,
+            detail="The `ots` CLI is not installed. Ensure `opentimestamps-client` is in requirements.txt",
+        )
 
     stdout = proc.stdout.strip()
     stderr = proc.stderr.strip()
 
-    # Heuristic: consider OK if stdout mentions Bitcoin block or 'Attestation verified'
+    # Heurística simple de OK
     ok = (proc.returncode == 0) or ("Bitcoin block" in stdout) or ("verified" in stdout.lower())
     return {"ok": bool(ok), "stdout": stdout, "stderr": stderr, "returncode": proc.returncode}
 
@@ -63,10 +58,10 @@ async def health():
 async def index():
     return """
     <!doctype html>
-    <html lang=\"es\">
+    <html lang="es">
     <head>
-      <meta charset=\"utf-8\"> 
-      <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
+      <meta charset="utf-8"> 
+      <meta name="viewport" content="width=device-width,initial-scale=1">
       <title>Autoris · Verificador OpenTimestamps</title>
       <style>
         body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,sans-serif;margin:2rem;line-height:1.5}
@@ -155,25 +150,23 @@ async def verify_ots(
     ots_file: UploadFile = File(...),
     target_file: Optional[UploadFile] = File(None),
 ):
-    # Save to temp and verify with CLI
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
+
+        # Guardar prueba .ots
         ots_path = td / (ots_file.filename or "proof.ots")
         ots_bytes = await ots_file.read()
         ots_path.write_bytes(ots_bytes)
 
-        target_path = None
-        if target_file is not None:
-            target_path = td / (target_file.filename or "target.bin")
-            target_bytes = await target_file.read()
-            target_path.write_bytes(target_bytes)
-
-        result = _run_ots_verify(ots_path, target_path)
-
-        # If we also have the original, compute its hash for your records
+        # Si suben el original, SOLO calculamos hash (no lo pasamos al CLI)
         file_hash = None
         if target_file is not None:
-            file_hash = _sha256_bytes(target_path.read_bytes())
+            target_bytes = await target_file.read()
+            if target_bytes:  # evita crear target.bin vacío
+                file_hash = _sha256_bytes(target_bytes)
+
+        # Verificar solo con la .ots
+        result = _run_ots_verify(ots_path)
 
         return {
             "ok": result["ok"],
@@ -191,10 +184,13 @@ async def verify_by_hash(file_hash: str):
 
     candidate = PROOFS_DIR / f"{file_hash}.ots"
     if not candidate.exists():
-        return JSONResponse(status_code=404, content={
-            "ok": False,
-            "detail": f"No local proof found for {file_hash}. Place a matching '{file_hash}.ots' under {PROOFS_DIR} or upload via /verify-ots.",
-        })
+        return JSONResponse(
+            status_code=404,
+            content={
+                "ok": False,
+                "detail": f"No local proof found for {file_hash}. Place a matching '{file_hash}.ots' under {PROOFS_DIR} or upload via /verify-ots.",
+            },
+        )
 
     result = _run_ots_verify(candidate)
     return {
