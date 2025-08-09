@@ -5,21 +5,20 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 APP_NAME = "autoris-ots-microservice"
 PROOFS_DIR = Path(os.getenv("PROOFS_DIR", "./proofs")).resolve()
 PROOFS_DIR.mkdir(parents=True, exist_ok=True)
 
-# Flags del CLI (podés cambiarlos por env)
+# Flags del CLI
 OTS_VERIFY_ARGS = os.getenv("OTS_VERIFY_ARGS", "--no-bitcoin").split()
 OTS_UPGRADE_ARGS = os.getenv("OTS_UPGRADE_ARGS", "").split()
 
 app = FastAPI(title=f"{APP_NAME}")
 
-# CORS (abrimos todo para pruebas; ajustá si hace falta)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -27,8 +26,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# -------------------- utilidades --------------------
 
 def _sha256_bytes(data: bytes) -> str:
     h = hashlib.sha256()
@@ -48,20 +45,16 @@ def _run(cmd: list[str]) -> dict:
     }
 
 def _run_ots_verify(ots_path: Path) -> dict:
-    # IMPORTANTE: opciones globales ANTES del subcomando
     cmd = ["ots", *OTS_VERIFY_ARGS, "verify", str(ots_path)]
     r = _run(cmd)
     text = (r["stdout"] + "\n" + r["stderr"]).lower()
-    # Heurística: consideramos OK si detectamos attestations verificables
-    if ("bitcoin block" in text) or ("attestation verified" in text) or ("pending confirmation" in text):
+    if ("bitcoin block" in text) or ("attestation verified" in text):
         r["ok"] = True
     return r
 
 def _run_ots_upgrade(ots_path: Path) -> dict:
     cmd = ["ots", *OTS_UPGRADE_ARGS, "upgrade", str(ots_path)]
     return _run(cmd)
-
-# -------------------- endpoints --------------------
 
 @app.get("/health")
 async def health():
@@ -124,36 +117,67 @@ async def index():
     <script>
     const $ = s => document.querySelector(s);
 
+    // --- 1) Verificar .ots ---
     $('#f-ots').addEventListener('submit', async (e) => {
       e.preventDefault();
       const fd = new FormData(e.target);
-      // si querés que el servidor guarde {hash}.ots, agregá ?save=1 al fetch (te paso el script luego)
+
+      const otsFile = fd.get("ots_file");
+      if (!otsFile || otsFile.size === 0) {
+        alert("Por favor selecciona un archivo .ots");
+        return;
+      }
+
       const res = await fetch('/verify-ots', { method:'POST', body: fd });
       const data = await res.json();
-      const pre = $('#out-ots'); pre.hidden=false; pre.textContent = JSON.stringify(data, null, 2);
+
+      const pre = $('#out-ots');
+      pre.hidden = false;
+      pre.textContent = JSON.stringify(data, null, 2);
     });
 
+    // --- 2) Calcular SHA-256 ---
     $('#f-hash').addEventListener('submit', async (e) => {
       e.preventDefault();
       const fd = new FormData(e.target);
       const res = await fetch('/hash', { method:'POST', body: fd });
       const data = await res.json();
-      const pre = $('#out-hash'); pre.hidden=false; pre.textContent = JSON.stringify(data, null, 2);
+
+      const pre = $('#out-hash');
+      pre.hidden = false;
+      pre.textContent = JSON.stringify(data, null, 2);
     });
 
+    // --- 3) Upgrade .ots ---
     $('#f-up').addEventListener('submit', async (e) => {
       e.preventDefault();
       const fd = new FormData(e.target);
+      const otsFile = fd.get("ots_file");
+      if (!otsFile || otsFile.size === 0) {
+        alert("Por favor selecciona un archivo .ots");
+        return;
+      }
       const res = await fetch('/upgrade-ots', { method:'POST', body: fd });
       const data = await res.json();
-      const pre = $('#out-up'); pre.hidden=false; pre.textContent = JSON.stringify(data, null, 2);
+
+      const pre = $('#out-up');
+      pre.hidden = false;
+      pre.textContent = JSON.stringify(data, null, 2);
     });
 
+    // --- 4) Verificar por hash ---
     $('#btn-verify-hash').addEventListener('click', async () => {
-      const h = $('#hash').value.trim(); if (!h) return;
+      const h = $('#hash').value.trim();
+      if (!h) {
+        alert("Ingrese un hash SHA-256");
+        return;
+      }
       const res = await fetch(`/verify?file_hash=${encodeURIComponent(h)}`);
       const data = await res.json();
-      const pre = $('#out-vhash'); pre.hidden=false; pre.textContent = JSON.stringify(data, null, 2);
+
+      const pre = $('#out-vhash');
+      pre.hidden = false;
+      pre.textContent = JSON.stringify(data, null, 2);
     });
     </script></body></html>
     """
@@ -167,33 +191,22 @@ async def hash_file(file: UploadFile = File(...)):
 async def verify_ots(
     ots_file: UploadFile = File(...),
     target_file: Optional[UploadFile] = File(None),
-    save: int = Query(0, description="Si =1, guarda la prueba como {file_hash}.ots (requiere archivo original)"),
 ):
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
 
-        # guardar .ots
         ots_path = td / (ots_file.filename or "proof.ots")
         ots_bytes = await ots_file.read()
         ots_path.write_bytes(ots_bytes)
 
         file_hash = None
-        # si suben el original, guardarlo con su nombre para que el CLI lo detecte y calcular hash
         if target_file is not None:
             target_bytes = await target_file.read()
             if target_bytes:
                 (td / (target_file.filename or "target.bin")).write_bytes(target_bytes)
                 file_hash = _sha256_bytes(target_bytes)
 
-        # verificar SOLO con la .ots (con flags globales antes del subcomando)
         result = _run_ots_verify(ots_path)
-
-        # guardado opcional {hash}.ots si tenemos hash del archivo original
-        saved_as = None
-        if save and file_hash:
-            dest = PROOFS_DIR / f"{file_hash}.ots"
-            dest.write_bytes(ots_bytes)  # guardamos la prueba tal como vino
-            saved_as = str(dest)
 
         return {
             "ok": result["ok"],
@@ -201,56 +214,24 @@ async def verify_ots(
             "stdout": result["stdout"],
             "stderr": result["stderr"],
             "file_hash": file_hash,
-            "saved_as": saved_as,
         }
 
 @app.post("/upgrade-ots")
-async def upgrade_ots(
-    ots_file: UploadFile = File(...),
-    save: int = Query(0, description="Si =1, guarda la .ots mejorada en PROOFS_DIR"),
-    by_hash: int = Query(1, description="Si save=1 y by_hash=1, nombre {sha256(ots)}.ots"),
-):
+async def upgrade_ots(ots_file: UploadFile = File(...)):
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         ots_path = td / (ots_file.filename or "proof.ots")
-        ots_bytes = await ots_file.read()
-        ots_path.write_bytes(ots_bytes)
+        ots_path.write_bytes(await ots_file.read())
 
         r = _run_ots_upgrade(ots_path)
-        upgraded = ots_path.read_bytes()
-        filename = ots_file.filename or "proof.ots"
-
-        # Guardado opcional en servidor
-        saved_as = None
-        if save:
-            out_name = filename
-            if by_hash:
-                out_name = f"{_sha256_bytes(upgraded)}.ots"
-            dest = PROOFS_DIR / out_name
-            dest.write_bytes(upgraded)
-            saved_as = str(dest)
-
-        # Si no mejoró (Pending), devolvemos JSON
-        if not r["ok"]:
-            return {
-                "ok": False,
-                "returncode": r["returncode"],
-                "stdout": r["stdout"],
-                "stderr": r["stderr"],
-                "ots_size": len(upgraded),
-                "saved_as": saved_as,
-            }
-
-        # Si mejoró, devolvemos archivo como descarga
-        return StreamingResponse(
-            iter([upgraded]),
-            media_type="application/octet-stream",
-            headers={
-                "Content-Disposition": f'attachment; filename="{filename}"',
-                "X-OTS-ReturnCode": str(r["returncode"]),
-                "X-OTS-Saved-As": saved_as or "",
-            },
-        )
+        upgraded_bytes = ots_path.read_bytes()
+        return {
+            "ok": r["ok"],
+            "returncode": r["returncode"],
+            "stdout": r["stdout"],
+            "stderr": r["stderr"],
+            "ots_size": len(upgraded_bytes),
+        }
 
 @app.get("/verify")
 async def verify_by_hash(file_hash: str):
@@ -262,7 +243,7 @@ async def verify_by_hash(file_hash: str):
     if not candidate.exists():
         return JSONResponse(status_code=404, content={
             "ok": False,
-            "detail": f"No local proof found for {file_hash}. Place a matching '{file_hash}.ots' under {PROOFS_DIR} or upload via /verify-ots?save=1.",
+            "detail": f"No local proof found for {file_hash}. Place a matching '{file_hash}.ots' under {PROOFS_DIR} or upload via /verify-ots.",
         })
 
     result = _run_ots_verify(candidate)
