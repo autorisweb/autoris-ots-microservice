@@ -29,12 +29,18 @@ def _sha256_bytes(data: bytes) -> str:
     h.update(data)
     return h.hexdigest()
 
-def _run_ots_verify(ots_path: Path) -> dict:
+def _run_ots_verify(ots_path: Path, target_path: Optional[Path] = None) -> dict:
     """
-    Ejecuta `ots verify` SOLO con la prueba .ots.
-    (El archivo original NO se pasa como argumento al CLI.)
+    Ejecuta `ots verify`. Si hay archivo original, va PRIMERO y luego la .ots.
+    Ejemplos válidos:
+      - ots verify original.ext prueba.ots
+      - ots verify prueba.ots        (intenta deducir el original; puede fallar)
     """
-    cmd = ["ots", "verify", str(ots_path)]
+    if target_path is not None:
+        cmd = ["ots", "verify", str(target_path), str(ots_path)]
+    else:
+        cmd = ["ots", "verify", str(ots_path)]
+
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
     except FileNotFoundError:
@@ -46,7 +52,6 @@ def _run_ots_verify(ots_path: Path) -> dict:
     stdout = proc.stdout.strip()
     stderr = proc.stderr.strip()
 
-    # Heurística simple de OK
     ok = (proc.returncode == 0) or ("Bitcoin block" in stdout) or ("verified" in stdout.lower())
     return {"ok": bool(ok), "stdout": stdout, "stderr": stderr, "returncode": proc.returncode}
 
@@ -80,7 +85,7 @@ async def index():
     <body>
       <div class="card">
         <h1>Verificador OpenTimestamps</h1>
-        <p>Subí tu <code>.ots</code> (y opcionalmente el archivo original) para validar su anclaje en Bitcoin.</p>
+        <p>Subí tu <code>.ots</code> y, si la tenés, el <b>archivo original</b> para validar su anclaje en Bitcoin.</p>
 
         <h2>1) Verificar .ots</h2>
         <form id="f-ots" enctype="multipart/form-data">
@@ -158,15 +163,19 @@ async def verify_ots(
         ots_bytes = await ots_file.read()
         ots_path.write_bytes(ots_bytes)
 
-        # Si suben el original, SOLO calculamos hash (no lo pasamos al CLI)
         file_hash = None
+        target_path: Optional[Path] = None
+
+        # Si suben el original, lo guardamos y calculamos hash
         if target_file is not None:
             target_bytes = await target_file.read()
-            if target_bytes:  # evita crear target.bin vacío
+            if target_bytes:
+                target_path = td / (target_file.filename or "target.bin")
+                target_path.write_bytes(target_bytes)
                 file_hash = _sha256_bytes(target_bytes)
 
-        # Verificar solo con la .ots
-        result = _run_ots_verify(ots_path)
+        # Verificar: si hay original, va primero; si no, solo .ots (intentará deducir)
+        result = _run_ots_verify(ots_path, target_path)
 
         return {
             "ok": result["ok"],
