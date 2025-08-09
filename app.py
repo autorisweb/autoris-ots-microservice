@@ -82,7 +82,7 @@ async def index():
       input[type=file],input[type=text]{width:100%;padding:.5rem;border:1px solid #d1d5db;border-radius:10px}
       button{padding:.6rem 1rem;border:0;border-radius:999px;cursor:pointer}
       .primary{background:#111827;color:#fff}.muted{background:#f3f4f6}
-      .row{display:grid;grid-template-columns:1fr auto;gap:.75rem;align-items:end}
+      .row{display:grid;grid-template-columns:1fr auto;gap:.75rem;align-items=end}
       pre{background:#0b1020;color:#d7e1ff;padding:1rem;border-radius:10px;overflow:auto}
       footer{margin-top:1rem;color:#6b7280;font-size:.9rem}
     </style>
@@ -308,6 +308,7 @@ async def upgrade_ots(
             },
         )
 
+# ⬇️ Endpoint actualizado: muestra estado "pending/complete" si no hay original
 @app.get("/verify")
 async def verify_by_hash(file_hash: str):
     file_hash = file_hash.lower().strip()
@@ -321,11 +322,32 @@ async def verify_by_hash(file_hash: str):
             "detail": f"No local proof found for {file_hash}. Colocá '{file_hash}.ots' en {PROOFS_DIR} o subí vía /verify-ots?save=1.",
         })
 
+    # 1) Intento de verificación de contenido (normalmente requeriría el archivo original)
     result = _run_ots_verify(candidate)
+    if result["ok"]:
+        return {
+            "ok": True,
+            "mode": "content_verify",
+            "returncode": result["returncode"],
+            "stdout": result["stdout"],
+            "stderr": result["stderr"],
+            "used_proof": str(candidate),
+        }
+
+    # 2) Sin original: devolvemos ESTADO ejecutando 'upgrade' (no valida contenido)
+    up = _run_ots_upgrade(candidate)
+    text = (up["stdout"] + "\n" + up["stderr"]).lower()
+    status = "pending"
+    if "success! timestamp complete" in text or "timestamp complete" in text:
+        status = "complete"
+
     return {
-        "ok": result["ok"],
-        "stdout": result["stdout"],
-        "stderr": result["stderr"],
-        "returncode": result["returncode"],
+        "ok": (status == "complete"),
+        "mode": "status_only",
+        "status": status,
+        "returncode": up["returncode"],
+        "stdout": up["stdout"],
+        "stderr": up["stderr"],
         "used_proof": str(candidate),
+        "note": "Sin archivo original no se verifica el contenido; solo el estado de la prueba.",
     }
