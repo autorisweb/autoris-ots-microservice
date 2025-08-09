@@ -13,6 +13,10 @@ APP_NAME = "autoris-ots-microservice"
 PROOFS_DIR = Path(os.getenv("PROOFS_DIR", "./proofs")).resolve()
 PROOFS_DIR.mkdir(parents=True, exist_ok=True)
 
+# Opcional: controlar flags por env
+OTS_VERIFY_ARGS = os.getenv("OTS_VERIFY_ARGS", "--no-bitcoin").split()
+OTS_UPGRADE_ARGS = os.getenv("OTS_UPGRADE_ARGS", "").split()
+
 app = FastAPI(title=f"{APP_NAME}")
 
 app.add_middleware(
@@ -28,16 +32,32 @@ def _sha256_bytes(data: bytes) -> str:
     h.update(data)
     return h.hexdigest()
 
-def _run_ots_verify(ots_path: Path) -> dict:
-    cmd = ["ots", "verify", str(ots_path)]
+def _run(cmd: list[str]) -> dict:
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    except FileNotFoundError:
-        raise HTTPException(status_code=500, detail="The `ots` CLI is not installed. Ensure `opentimestamps-client` is in requirements.txt")
-    stdout = proc.stdout.strip()
-    stderr = proc.stderr.strip()
-    ok = (proc.returncode == 0) or ("Bitcoin block" in stdout) or ("verified" in stdout.lower())
-    return {"ok": bool(ok), "stdout": stdout, "stderr": stderr, "returncode": proc.returncode}
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=500, detail=f"Executable not found: {cmd[0]}. {e}")
+    return {
+        "returncode": proc.returncode,
+        "stdout": proc.stdout.strip(),
+        "stderr": proc.stderr.strip(),
+        "ok": proc.returncode == 0,
+    }
+
+def _run_ots_verify(ots_path: Path) -> dict:
+    # Siempre verificamos solo con la .ots; si el archivo original está en la misma carpeta
+    # con el mismo nombre (sin .ots), el CLI lo detecta solo.
+    cmd = ["ots", "verify", *OTS_VERIFY_ARGS, str(ots_path)]
+    r = _run(cmd)
+    # Heurística de OK si el CLI no devuelve 0 pero indica verificación en el texto
+    text = (r["stdout"] + "\n" + r["stderr"]).lower()
+    if ("bitcoin block" in text) or ("attestation verified" in text):
+        r["ok"] = True
+    return r
+
+def _run_ots_upgrade(ots_path: Path) -> dict:
+    cmd = ["ots", "upgrade", *OTS_UPGRADE_ARGS, str(ots_path)]
+    return _run(cmd)
 
 @app.get("/health")
 async def health():
@@ -81,7 +101,14 @@ async def index():
       </form>
       <pre id="out-hash" hidden></pre>
 
-      <h2>3) Verificar por hash (si existe {hash}.ots en el servidor)</h2>
+      <h2>3) Upgrade .ots (si dice Pending)</h2>
+      <form id="f-up" enctype="multipart/form-data">
+        <input type="file" name="ots_file" accept=".ots" required>
+        <button class="muted" type="submit">Upgrade</button>
+      </form>
+      <pre id="out-up" hidden></pre>
+
+      <h2>4) Verificar por hash (si existe {hash}.ots en el servidor)</h2>
       <div class="row">
         <input type="text" id="hash" placeholder="Ingrese SHA-256 en hex...">
         <button class="muted" id="btn-verify-hash">Verificar</button>
@@ -92,6 +119,7 @@ async def index():
     </div>
     <script>
     const $ = s => document.querySelector(s);
+
     $('#f-ots').addEventListener('submit', async (e) => {
       e.preventDefault();
       const fd = new FormData(e.target);
@@ -99,6 +127,7 @@ async def index():
       const data = await res.json();
       const pre = $('#out-ots'); pre.hidden=false; pre.textContent = JSON.stringify(data, null, 2);
     });
+
     $('#f-hash').addEventListener('submit', async (e) => {
       e.preventDefault();
       const fd = new FormData(e.target);
@@ -106,6 +135,15 @@ async def index():
       const data = await res.json();
       const pre = $('#out-hash'); pre.hidden=false; pre.textContent = JSON.stringify(data, null, 2);
     });
+
+    $('#f-up').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const fd = new FormData(e.target);
+      const res = await fetch('/upgrade-ots', { method:'POST', body: fd });
+      const data = await res.json();
+      const pre = $('#out-up'); pre.hidden=false; pre.textContent = JSON.stringify(data, null, 2);
+    });
+
     $('#btn-verify-hash').addEventListener('click', async () => {
       const h = $('#hash').value.trim(); if (!h) return;
       const res = await fetch(`/verify?file_hash=${encodeURIComponent(h)}`);
@@ -134,15 +172,14 @@ async def verify_ots(
         ots_path.write_bytes(ots_bytes)
 
         file_hash = None
-        # si suben el original, guardarlo con SU MISMO NOMBRE (ej: foo.png)
+        # si suben el original, guardarlo con su nombre para que el CLI lo detecte
         if target_file is not None:
             target_bytes = await target_file.read()
             if target_bytes:
-                target_save = td / (target_file.filename or "target.bin")
-                target_save.write_bytes(target_bytes)
+                (td / (target_file.filename or "target.bin")).write_bytes(target_bytes)
                 file_hash = _sha256_bytes(target_bytes)
 
-        # verificar SOLO con la .ots (si el original está al lado, el CLI lo encuentra)
+        # verificar SOLO con la .ots (con --no-bitcoin por defecto)
         result = _run_ots_verify(ots_path)
 
         return {
@@ -151,6 +188,25 @@ async def verify_ots(
             "stdout": result["stdout"],
             "stderr": result["stderr"],
             "file_hash": file_hash,
+        }
+
+@app.post("/upgrade-ots")
+async def upgrade_ots(ots_file: UploadFile = File(...)):
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        ots_path = td / (ots_file.filename or "proof.ots")
+        ots_path.write_bytes(await ots_file.read())
+
+        r = _run_ots_upgrade(ots_path)
+
+        # Devolvemos la .ots (posiblemente actualizada)
+        upgraded_bytes = ots_path.read_bytes()
+        return {
+            "ok": r["ok"],
+            "returncode": r["returncode"],
+            "stdout": r["stdout"],
+            "stderr": r["stderr"],
+            "ots_size": len(upgraded_bytes),
         }
 
 @app.get("/verify")
