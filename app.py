@@ -13,7 +13,7 @@ APP_NAME = "autoris-ots-microservice"
 PROOFS_DIR = Path(os.getenv("PROOFS_DIR", "./proofs")).resolve()
 PROOFS_DIR.mkdir(parents=True, exist_ok=True)
 
-# Opcional: controlar flags por env
+# Flags del CLI (puedes cambiarlos por env si quieres)
 OTS_VERIFY_ARGS = os.getenv("OTS_VERIFY_ARGS", "--no-bitcoin").split()
 OTS_UPGRADE_ARGS = os.getenv("OTS_UPGRADE_ARGS", "").split()
 
@@ -45,18 +45,17 @@ def _run(cmd: list[str]) -> dict:
     }
 
 def _run_ots_verify(ots_path: Path) -> dict:
-    # Siempre verificamos solo con la .ots; si el archivo original está en la misma carpeta
-    # con el mismo nombre (sin .ots), el CLI lo detecta solo.
-    cmd = ["ots", "verify", *OTS_VERIFY_ARGS, str(ots_path)]
+    # IMPORTANTE: opciones globales ANTES del subcomando
+    cmd = ["ots", *OTS_VERIFY_ARGS, "verify", str(ots_path)]
     r = _run(cmd)
-    # Heurística de OK si el CLI no devuelve 0 pero indica verificación en el texto
     text = (r["stdout"] + "\n" + r["stderr"]).lower()
     if ("bitcoin block" in text) or ("attestation verified" in text):
         r["ok"] = True
     return r
 
 def _run_ots_upgrade(ots_path: Path) -> dict:
-    cmd = ["ots", "upgrade", *OTS_UPGRADE_ARGS, str(ots_path)]
+    # También ponemos flags antes del subcomando por consistencia
+    cmd = ["ots", *OTS_UPGRADE_ARGS, "upgrade", str(ots_path)]
     return _run(cmd)
 
 @app.get("/health")
@@ -179,7 +178,7 @@ async def verify_ots(
                 (td / (target_file.filename or "target.bin")).write_bytes(target_bytes)
                 file_hash = _sha256_bytes(target_bytes)
 
-        # verificar SOLO con la .ots (con --no-bitcoin por defecto)
+        # verificar SOLO con la .ots (con flags globales antes del subcomando)
         result = _run_ots_verify(ots_path)
 
         return {
@@ -198,8 +197,6 @@ async def upgrade_ots(ots_file: UploadFile = File(...)):
         ots_path.write_bytes(await ots_file.read())
 
         r = _run_ots_upgrade(ots_path)
-
-        # Devolvemos la .ots (posiblemente actualizada)
         upgraded_bytes = ots_path.read_bytes()
         return {
             "ok": r["ok"],
