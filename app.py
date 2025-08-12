@@ -1,4 +1,5 @@
 import os
+import base64
 import hashlib
 import tempfile
 import subprocess
@@ -63,6 +64,14 @@ def _run_ots_upgrade(ots_path: Path) -> dict:
     cmd = ["ots", *OTS_UPGRADE_ARGS, "upgrade", str(ots_path)]
     return _run(cmd)
 
+def _run_ots_stamp(target_path: Path) -> dict:
+    """
+    Ejecuta `ots stamp <archivo>`, que genera <archivo>.ots junto al original.
+    No requiere bitcoind; usa los calendarios públicos.
+    """
+    cmd = ["ots", "stamp", str(target_path)]
+    return _run(cmd)
+
 # -------------------- endpoints --------------------
 
 @app.get("/health")
@@ -82,7 +91,7 @@ async def index():
       input[type=file],input[type=text]{width:100%;padding:.5rem;border:1px solid #d1d5db;border-radius:10px}
       button{padding:.6rem 1rem;border:0;border-radius:999px;cursor:pointer}
       .primary{background:#111827;color:#fff}.muted{background:#f3f4f6}
-      .row{display:grid;grid-template-columns:1fr auto;gap:.75rem;align-items=end}
+      .row{display:grid;grid-template-columns:1fr auto;gap:.75rem;align-items:end}
       pre{background:#0b1020;color:#d7e1ff;padding:1rem;border-radius:10px;overflow:auto}
       footer{margin-top:1rem;color:#6b7280;font-size:.9rem}
     </style>
@@ -219,6 +228,76 @@ async def hash_file(file: UploadFile = File(...)):
     data = await file.read()
     return {"filename": file.filename, "sha256": _sha256_bytes(data), "size": len(data)}
 
+# -------- NUEVO: STAMP para integrar con Make (PDF -> OTS) --------
+@app.post("/stamp-file")
+async def stamp_file(
+    file: UploadFile = File(...),
+    save: int = Query(1, description="Si =1, guarda {file_hash}.ots en PROOFS_DIR"),
+    download: int = Query(0, description="Si =1, devuelve la .ots como attachment en vez de JSON"),
+):
+    """
+    Recibe un archivo (ej: el PDF del certificado), crea su prueba OTS,
+    y devuelve:
+      - JSON con {file_hash, proof_b64, ots_size} (por defecto), o
+      - attachment .ots si download=1.
+    Si save=1, también guarda {file_hash}.ots en PROOFS_DIR.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+
+        # 1) Guardar el archivo con su nombre (para que `ots stamp` genere <nombre>.ots)
+        target_path = td / (file.filename or "target.bin")
+        data = await file.read()
+        target_path.write_bytes(data)
+
+        # 2) Ejecutar `ots stamp`
+        r = _run_ots_stamp(target_path)
+
+        # 3) La prueba queda como <archivo>.ots
+        proof_path = target_path.with_suffix(target_path.suffix + ".ots")
+        if not proof_path.exists():
+            return JSONResponse(status_code=500, content={
+                "ok": False,
+                "returncode": r["returncode"],
+                "stdout": r["stdout"],
+                "stderr": r["stderr"],
+                "detail": "No se generó el archivo .ots",
+            })
+
+        proof_bytes = proof_path.read_bytes()
+        file_hash = _sha256_bytes(data)
+
+        # 4) Guardado opcional {file_hash}.ots en PROOFS_DIR
+        saved_as = None
+        if save:
+            dest = PROOFS_DIR / f"{file_hash}.ots"
+            dest.write_bytes(proof_bytes)
+            saved_as = str(dest)
+
+        # 5) Respuesta
+        if download:
+            return StreamingResponse(
+                iter([proof_bytes]),
+                media_type="application/octet-stream",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{(file.filename or "target.bin")}.ots"',
+                    "X-File-Hash": file_hash,
+                    "X-Saved-As": saved_as or "",
+                },
+            )
+
+        proof_b64 = base64.b64encode(proof_bytes).decode("ascii")
+        return {
+            "ok": True,
+            "file_hash": file_hash,
+            "ots_size": len(proof_bytes),
+            "proof_b64": proof_b64,
+            "saved_as": saved_as,
+            "returncode": r["returncode"],
+            "stdout": r["stdout"],
+            "stderr": r["stderr"],
+        }
+
 @app.post("/verify-ots")
 async def verify_ots(
     ots_file: UploadFile = File(...),
@@ -308,7 +387,7 @@ async def upgrade_ots(
             },
         )
 
-# ⬇️ Endpoint actualizado: muestra estado "pending/complete" si no hay original
+# ⬇️ Endpoint: muestra estado "pending/complete" si no hay original
 @app.get("/verify")
 async def verify_by_hash(file_hash: str):
     file_hash = file_hash.lower().strip()
