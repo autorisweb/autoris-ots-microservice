@@ -17,6 +17,7 @@ PROOFS_DIR = Path(os.getenv("PROOFS_DIR", "./proofs")).resolve()
 PROOFS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Flags del CLI (podés cambiarlos por env). IMPORTANTE: van ANTES del subcomando.
+# --no-bitcoin en verify evita que requiera bitcoind local; muestra estado (pending/complete).
 OTS_VERIFY_ARGS = os.getenv("OTS_VERIFY_ARGS", "--no-bitcoin").split()
 OTS_UPGRADE_ARGS = os.getenv("OTS_UPGRADE_ARGS", "").split()
 
@@ -86,7 +87,7 @@ async def index():
     <title>Autoris · Verificador OpenTimestamps</title>
     <style>
       body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,sans-serif;margin:2rem;line-height:1.5}
-      .card{max-width:780px;margin:auto;padding:1.25rem;border:1px solid #e5e7eb;border-radius:16px;box-shadow:0 1px 8px rgba(0,0,0,.04)}
+      .card{max-width:880px;margin:auto;padding:1.25rem;border:1px solid #e5e7eb;border-radius:16px;box-shadow:0 1px 8px rgba(0,0,0,.04)}
       h1{font-size:1.5rem;margin:0 0 .75rem} h2{font-size:1.1rem;margin:1.25rem 0 .5rem}
       input[type=file],input[type=text]{width:100%;padding:.5rem;border:1px solid #d1d5db;border-radius:10px}
       button{padding:.6rem 1rem;border:0;border-radius:999px;cursor:pointer}
@@ -130,6 +131,13 @@ async def index():
       </div>
       <pre id="out-vhash" hidden></pre>
 
+      <h2>5) Sellar (crear .ots) — para probar</h2>
+      <form id="f-stamp" enctype="multipart/form-data">
+        <input type="file" name="file" required>
+        <button class="muted" type="submit">Sellar y descargar .ots</button>
+      </form>
+      <pre id="out-stamp" hidden></pre>
+
       <footer>Autoris · Microservicio de verificación · v1</footer>
     </div>
     <script>
@@ -140,23 +148,13 @@ async def index():
       e.preventDefault();
       const form = e.target;
       const fd = new FormData(form);
-
       const otsFile = fd.get("ots_file");
-      if (!otsFile || otsFile.size === 0) {
-        alert("Por favor selecciona un archivo .ots");
-        return;
-      }
-
-      // Si hay archivo original, pedimos al backend que guarde {hash}.ots
+      if (!otsFile || otsFile.size === 0) { alert("Por favor selecciona un archivo .ots"); return; }
       const target = fd.get("target_file");
       const url = (target && target.size > 0) ? '/verify-ots?save=1' : '/verify-ots';
-
       const res = await fetch(url, { method:'POST', body: fd });
       const data = await res.json();
-
-      const pre = $('#out-ots');
-      pre.hidden = false;
-      pre.textContent = JSON.stringify(data, null, 2);
+      const pre = $('#out-ots'); pre.hidden = false; pre.textContent = JSON.stringify(data, null, 2);
     });
 
     // --- 2) Calcular SHA-256 ---
@@ -165,10 +163,7 @@ async def index():
       const fd = new FormData(e.target);
       const res = await fetch('/hash', { method:'POST', body: fd });
       const data = await res.json();
-
-      const pre = $('#out-hash');
-      pre.hidden = false;
-      pre.textContent = JSON.stringify(data, null, 2);
+      const pre = $('#out-hash'); pre.hidden = false; pre.textContent = JSON.stringify(data, null, 2);
     });
 
     // --- 3) Upgrade .ots ---
@@ -176,14 +171,8 @@ async def index():
       e.preventDefault();
       const fd = new FormData(e.target);
       const otsFile = fd.get("ots_file");
-      if (!otsFile || otsFile.size === 0) {
-        alert("Por favor selecciona un archivo .ots");
-        return;
-      }
-      // Pedimos que también la guarde en el server por hash de la .ots final
+      if (!otsFile || otsFile.size === 0) { alert("Por favor selecciona un archivo .ots"); return; }
       const res = await fetch('/upgrade-ots?save=1&by_hash=1', { method:'POST', body: fd });
-
-      // Si el server devuelve un attachment, descargamos el archivo
       const cd = res.headers.get('Content-Disposition') || '';
       if (res.ok && cd.includes('attachment')) {
         const blob = await res.blob();
@@ -192,33 +181,43 @@ async def index():
         const a = document.createElement('a');
         a.href = url; a.download = fname; document.body.appendChild(a); a.click(); a.remove();
         URL.revokeObjectURL(url);
-
-        const pre = $('#out-up');
-        pre.hidden = false;
+        const pre = $('#out-up'); pre.hidden = false;
         pre.textContent = JSON.stringify({ ok: true, detail: `Descargada ${fname}`, saved_as: res.headers.get('X-OTS-Saved-As') || null }, null, 2);
         return;
       }
-
-      // Si no fue attachment, mostramos el JSON (p.ej. aún Pending)
       const data = await res.json();
-      const pre = $('#out-up');
-      pre.hidden = false;
-      pre.textContent = JSON.stringify(data, null, 2);
+      const pre = $('#out-up'); pre.hidden = false; pre.textContent = JSON.stringify(data, null, 2);
     });
 
     // --- 4) Verificar por hash ---
     $('#btn-verify-hash').addEventListener('click', async () => {
       const h = $('#hash').value.trim();
-      if (!h) {
-        alert("Ingrese un hash SHA-256");
-        return;
-      }
+      if (!h) { alert("Ingrese un hash SHA-256"); return; }
       const res = await fetch(`/verify?file_hash=${encodeURIComponent(h)}`);
       const data = await res.json();
+      const pre = $('#out-vhash'); pre.hidden = false; pre.textContent = JSON.stringify(data, null, 2);
+    });
 
-      const pre = $('#out-vhash');
-      pre.hidden = false;
-      pre.textContent = JSON.stringify(data, null, 2);
+    // --- 5) Sellar (crear .ots) ---
+    $('#f-stamp').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const fd = new FormData(e.target);
+      // save=1 => guarda {file_hash}.ots; download=1 => devuelve archivo para descargar
+      const res = await fetch('/stamp-file?save=1&download=1', { method:'POST', body: fd });
+      const cd = res.headers.get('Content-Disposition') || '';
+      if (res.ok && cd.includes('attachment')) {
+        const blob = await res.blob();
+        const fname = (cd.match(/filename="([^"]+)"/) || [,'proof.ots'])[1];
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = fname; document.body.appendChild(a); a.click(); a.remove();
+        URL.revokeObjectURL(url);
+        const pre = $('#out-stamp'); pre.hidden = false;
+        pre.textContent = JSON.stringify({ ok: true, detail: `Descargada ${fname}`, saved_as: res.headers.get('X-Saved-As') || null, file_hash: res.headers.get('X-File-Hash') || null }, null, 2);
+        return;
+      }
+      const data = await res.json();
+      const pre = $('#out-stamp'); pre.hidden = false; pre.textContent = JSON.stringify(data, null, 2);
     });
     </script></body></html>
     """
@@ -228,7 +227,7 @@ async def hash_file(file: UploadFile = File(...)):
     data = await file.read()
     return {"filename": file.filename, "sha256": _sha256_bytes(data), "size": len(data)}
 
-# -------- NUEVO: STAMP para integrar con Make (PDF -> OTS) --------
+# -------- STAMP: PDF/archivo -> OTS --------
 @app.post("/stamp-file")
 async def stamp_file(
     file: UploadFile = File(...),
@@ -296,6 +295,7 @@ async def stamp_file(
             "returncode": r["returncode"],
             "stdout": r["stdout"],
             "stderr": r["stderr"],
+            "status": "pending",
         }
 
 @app.post("/verify-ots")
