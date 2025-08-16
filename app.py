@@ -1,4 +1,5 @@
 import os
+import re
 import base64
 import hashlib
 import tempfile
@@ -7,7 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 APP_NAME = "autoris-ots-microservice"
@@ -34,10 +35,10 @@ app.add_middleware(
 
 # -------------------- utilidades --------------------
 
+HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+
 def _sha256_bytes(data: bytes) -> str:
-    h = hashlib.sha256()
-    h.update(data)
-    return h.hexdigest()
+    return hashlib.sha256(data).hexdigest()
 
 def _run(cmd: list[str]) -> dict:
     try:
@@ -46,8 +47,8 @@ def _run(cmd: list[str]) -> dict:
         raise HTTPException(status_code=500, detail=f"Executable not found: {cmd[0]}. {e}")
     return {
         "returncode": proc.returncode,
-        "stdout": proc.stdout.strip(),
-        "stderr": proc.stderr.strip(),
+        "stdout": (proc.stdout or "").strip(),
+        "stderr": (proc.stderr or "").strip(),
         "ok": proc.returncode == 0,
     }
 
@@ -56,22 +57,34 @@ def _run_ots_verify(ots_path: Path) -> dict:
     cmd = ["ots", *OTS_VERIFY_ARGS, "verify", str(ots_path)]
     r = _run(cmd)
     text = (r["stdout"] + "\n" + r["stderr"]).lower()
+
     # Heurística de OK (aunque el returncode sea 1 por --no-bitcoin o pending)
     if ("bitcoin block" in text) or ("attestation verified" in text) or ("pending confirmation" in text) or ("got" in text and "attestation" in text):
         r["ok"] = True
+    r["status"] = _status_from_text(text)
     return r
 
 def _run_ots_upgrade(ots_path: Path) -> dict:
     cmd = ["ots", *OTS_UPGRADE_ARGS, "upgrade", str(ots_path)]
-    return _run(cmd)
+    r = _run(cmd)
+    text = (r["stdout"] + "\n" + r["stderr"]).lower()
+    r["status"] = _status_from_text(text)
+    return r
 
 def _run_ots_stamp(target_path: Path) -> dict:
-    """
-    Ejecuta `ots stamp <archivo>`, que genera <archivo>.ots junto al original.
-    No requiere bitcoind; usa los calendarios públicos.
-    """
+    """Ejecuta `ots stamp <archivo>`, que genera <archivo>.ots junto al original."""
     cmd = ["ots", "stamp", str(target_path)]
     return _run(cmd)
+
+def _status_from_text(text: str) -> str:
+    t = text.lower()
+    if "timestamp complete" in t or "attestation verified" in t or ("success!" in t and "complete" in t):
+        return "verified"
+    if "pending" in t or "pending confirmation" in t or "not enough confirmations" in t:
+        return "pending"
+    if "not a timestamp" in t or "error" in t or "failed" in t:
+        return "failed"
+    return "unknown"
 
 # -------------------- endpoints --------------------
 
@@ -81,6 +94,7 @@ async def health():
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
+    # (igual que tu versión actual: UI HTML simplificada para pruebas)
     return """
     <!doctype html><html lang="es"><head>
     <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -143,21 +157,16 @@ async def index():
     <script>
     const $ = s => document.querySelector(s);
 
-    // --- 1) Verificar .ots ---
+    // 1) Verificar .ots
     $('#f-ots').addEventListener('submit', async (e) => {
       e.preventDefault();
-      const form = e.target;
-      const fd = new FormData(form);
-      const otsFile = fd.get("ots_file");
-      if (!otsFile || otsFile.size === 0) { alert("Por favor selecciona un archivo .ots"); return; }
-      const target = fd.get("target_file");
-      const url = (target && target.size > 0) ? '/verify-ots?save=1' : '/verify-ots';
-      const res = await fetch(url, { method:'POST', body: fd });
+      const fd = new FormData(e.target);
+      const res = await fetch('/verify-ots?save=1', { method:'POST', body: fd });
       const data = await res.json();
       const pre = $('#out-ots'); pre.hidden = false; pre.textContent = JSON.stringify(data, null, 2);
     });
 
-    // --- 2) Calcular SHA-256 ---
+    // 2) Calcular hash
     $('#f-hash').addEventListener('submit', async (e) => {
       e.preventDefault();
       const fd = new FormData(e.target);
@@ -166,12 +175,10 @@ async def index():
       const pre = $('#out-hash'); pre.hidden = false; pre.textContent = JSON.stringify(data, null, 2);
     });
 
-    // --- 3) Upgrade .ots ---
+    // 3) Upgrade .ots
     $('#f-up').addEventListener('submit', async (e) => {
       e.preventDefault();
       const fd = new FormData(e.target);
-      const otsFile = fd.get("ots_file");
-      if (!otsFile || otsFile.size === 0) { alert("Por favor selecciona un archivo .ots"); return; }
       const res = await fetch('/upgrade-ots?save=1&by_hash=1', { method:'POST', body: fd });
       const cd = res.headers.get('Content-Disposition') || '';
       if (res.ok && cd.includes('attachment')) {
@@ -189,7 +196,7 @@ async def index():
       const pre = $('#out-up'); pre.hidden = false; pre.textContent = JSON.stringify(data, null, 2);
     });
 
-    // --- 4) Verificar por hash ---
+    // 4) Verificar por hash
     $('#btn-verify-hash').addEventListener('click', async () => {
       const h = $('#hash').value.trim();
       if (!h) { alert("Ingrese un hash SHA-256"); return; }
@@ -198,11 +205,10 @@ async def index():
       const pre = $('#out-vhash'); pre.hidden = false; pre.textContent = JSON.stringify(data, null, 2);
     });
 
-    // --- 5) Sellar (crear .ots) ---
+    // 5) Sellar y descargar
     $('#f-stamp').addEventListener('submit', async (e) => {
       e.preventDefault();
       const fd = new FormData(e.target);
-      // save=1 => guarda {file_hash}.ots; download=1 => devuelve archivo para descargar
       const res = await fetch('/stamp-file?save=1&download=1', { method:'POST', body: fd });
       const cd = res.headers.get('Content-Disposition') || '';
       if (res.ok && cd.includes('attachment')) {
@@ -243,16 +249,12 @@ async def stamp_file(
     """
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
-
-        # 1) Guardar el archivo con su nombre (para que `ots stamp` genere <nombre>.ots)
         target_path = td / (file.filename or "target.bin")
         data = await file.read()
         target_path.write_bytes(data)
 
-        # 2) Ejecutar `ots stamp`
         r = _run_ots_stamp(target_path)
 
-        # 3) La prueba queda como <archivo>.ots
         proof_path = target_path.with_suffix(target_path.suffix + ".ots")
         if not proof_path.exists():
             return JSONResponse(status_code=500, content={
@@ -266,37 +268,70 @@ async def stamp_file(
         proof_bytes = proof_path.read_bytes()
         file_hash = _sha256_bytes(data)
 
-        # 4) Guardado opcional {file_hash}.ots en PROOFS_DIR
+        # Guardado opcional {file_hash}.ots en PROOFS_DIR
         saved_as = None
         if save:
             dest = PROOFS_DIR / f"{file_hash}.ots"
             dest.write_bytes(proof_bytes)
             saved_as = str(dest)
 
-        # 5) Respuesta
+        # Respuesta binaria (descarga)
         if download:
             return StreamingResponse(
                 iter([proof_bytes]),
                 media_type="application/octet-stream",
                 headers={
-                    "Content-Disposition": f'attachment; filename="{(file.filename or "target.bin")}.ots"',
+                    "Content-Disposition": f'attachment; filename="{file_hash}.ots"',
                     "X-File-Hash": file_hash,
                     "X-Saved-As": saved_as or "",
                 },
             )
 
+        # JSON: base64 ESTÁNDAR con padding
         proof_b64 = base64.b64encode(proof_bytes).decode("ascii")
         return {
             "ok": True,
             "file_hash": file_hash,
             "ots_size": len(proof_bytes),
-            "proof_b64": proof_b64,
+            "proof_b64": proof_b64,   # estándar + padding
             "saved_as": saved_as,
             "returncode": r["returncode"],
             "stdout": r["stdout"],
             "stderr": r["stderr"],
             "status": "pending",
         }
+
+# Atajo: devuelve SIEMPRE la .ots en binario
+@app.post("/stamp-file.raw")
+async def stamp_file_raw(
+    file: UploadFile = File(...),
+    save: int = Query(1, description="Si =1, guarda {file_hash}.ots en PROOFS_DIR"),
+):
+    with tempfile.TemporaryDirectory() as td:
+        td = Path(td)
+        target_path = td / (file.filename or "target.bin")
+        data = await file.read()
+        target_path.write_bytes(data)
+
+        r = _run_ots_stamp(target_path)
+        proof_path = target_path.with_suffix(target_path.suffix + ".ots")
+        if not proof_path.exists():
+            return JSONResponse(status_code=500, content={
+                "ok": False, "detail": "No se generó el archivo .ots",
+                "returncode": r["returncode"], "stdout": r["stdout"], "stderr": r["stderr"],
+            })
+
+        proof_bytes = proof_path.read_bytes()
+        file_hash = _sha256_bytes(data)
+
+        if save:
+            (PROOFS_DIR / f"{file_hash}.ots").write_bytes(proof_bytes)
+
+        return Response(
+            content=proof_bytes,
+            media_type="application/octet-stream",
+            headers={"Content-Disposition": f'attachment; filename="{file_hash}.ots"'}
+        )
 
 @app.post("/verify-ots")
 async def verify_ots(
@@ -320,7 +355,6 @@ async def verify_ots(
                 (td / (target_file.filename or "target.bin")).write_bytes(target_bytes)
                 file_hash = _sha256_bytes(target_bytes)
 
-        # Verificar usando SOLO la .ots (el CLI detecta el original por nombre si existe)
         result = _run_ots_verify(ots_path)
 
         # Guardar {file_hash}.ots si lo pidieron y tenemos hash del original
@@ -331,7 +365,8 @@ async def verify_ots(
             saved_as = str(dest)
 
         return {
-            "ok": result["ok"],
+            "ok": (result["status"] == "verified"),
+            "status": result["status"],
             "returncode": result["returncode"],
             "stdout": result["stdout"],
             "stderr": result["stderr"],
@@ -366,9 +401,10 @@ async def upgrade_ots(
             saved_as = str(dest)
 
         # Si aún está pending, devolvemos JSON
-        if not r["ok"]:
+        if r["status"] != "verified":
             return {
                 "ok": False,
+                "status": r["status"],
                 "returncode": r["returncode"],
                 "stdout": r["stdout"],
                 "stderr": r["stderr"],
@@ -387,11 +423,10 @@ async def upgrade_ots(
             },
         )
 
-# ⬇️ Endpoint: muestra estado "pending/complete" si no hay original
 @app.get("/verify")
 async def verify_by_hash(file_hash: str):
     file_hash = file_hash.lower().strip()
-    if not (len(file_hash) == 64 and all(c in "0123456789abcdef" for c in file_hash)):
+    if not HEX64_RE.match(file_hash):
         raise HTTPException(status_code=400, detail="file_hash must be a 64-char hex SHA-256")
 
     candidate = PROOFS_DIR / f"{file_hash}.ots"
@@ -401,11 +436,12 @@ async def verify_by_hash(file_hash: str):
             "detail": f"No local proof found for {file_hash}. Colocá '{file_hash}.ots' en {PROOFS_DIR} o subí vía /verify-ots?save=1.",
         })
 
-    # 1) Intento de verificación de contenido (normalmente requeriría el archivo original)
+    # 1) Intento de verificación de contenido (sin original puede fallar)
     result = _run_ots_verify(candidate)
-    if result["ok"]:
+    if result["status"] == "verified":
         return {
             "ok": True,
+            "status": "verified",
             "mode": "content_verify",
             "returncode": result["returncode"],
             "stdout": result["stdout"],
@@ -413,17 +449,12 @@ async def verify_by_hash(file_hash: str):
             "used_proof": str(candidate),
         }
 
-    # 2) Sin original: devolvemos ESTADO ejecutando 'upgrade' (no valida contenido)
+    # 2) Sin original: devolvemos ESTADO ejecutando 'upgrade' (status only)
     up = _run_ots_upgrade(candidate)
-    text = (up["stdout"] + "\n" + up["stderr"]).lower()
-    status = "pending"
-    if "success! timestamp complete" in text or "timestamp complete" in text:
-        status = "complete"
-
     return {
-        "ok": (status == "complete"),
+        "ok": (up["status"] == "verified"),
+        "status": up["status"],
         "mode": "status_only",
-        "status": status,
         "returncode": up["returncode"],
         "stdout": up["stdout"],
         "stderr": up["stderr"],
