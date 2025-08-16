@@ -52,13 +52,28 @@ def _run(cmd: list[str]) -> dict:
         "ok": proc.returncode == 0,
     }
 
-def _run_ots_verify(ots_path: Path) -> dict:
-    # Flags globales ANTES del subcomando
+def _status_from_text(text: str) -> str:
+    t = text.lower()
+    if "timestamp complete" in t or "attestation verified" in t or ("success!" in t and "complete" in t):
+        return "verified"
+    if "pending" in t or "pending confirmation" in t or "not enough confirmations" in t:
+        return "pending"
+    if "not a timestamp" in t or "error" in t or "failed" in t:
+        return "failed"
+    return "unknown"
+
+def _run_ots_verify(ots_path: Path, target_path: Optional[Path] = None) -> dict:
+    """
+    Ejecuta `ots verify <proof.ots> [target]`
+    Pasamos el archivo original explícitamente si está disponible (robusto ante nombres raros).
+    """
     cmd = ["ots", *OTS_VERIFY_ARGS, "verify", str(ots_path)]
+    if target_path is not None:
+        cmd.append(str(target_path))
     r = _run(cmd)
     text = (r["stdout"] + "\n" + r["stderr"]).lower()
 
-    # Heurística de OK (aunque el returncode sea 1 por --no-bitcoin o pending)
+    # Heurística/estado
     if ("bitcoin block" in text) or ("attestation verified" in text) or ("pending confirmation" in text) or ("got" in text and "attestation" in text):
         r["ok"] = True
     r["status"] = _status_from_text(text)
@@ -76,16 +91,6 @@ def _run_ots_stamp(target_path: Path) -> dict:
     cmd = ["ots", "stamp", str(target_path)]
     return _run(cmd)
 
-def _status_from_text(text: str) -> str:
-    t = text.lower()
-    if "timestamp complete" in t or "attestation verified" in t or ("success!" in t and "complete" in t):
-        return "verified"
-    if "pending" in t or "pending confirmation" in t or "not enough confirmations" in t:
-        return "pending"
-    if "not a timestamp" in t or "error" in t or "failed" in t:
-        return "failed"
-    return "unknown"
-
 # -------------------- endpoints --------------------
 
 @app.get("/health")
@@ -94,7 +99,7 @@ async def health():
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    # (igual que tu versión actual: UI HTML simplificada para pruebas)
+    # UI mínima para pruebas manuales
     return """
     <!doctype html><html lang="es"><head>
     <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -342,22 +347,25 @@ async def verify_ots(
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
 
-        # Guardar .ots temporal
+        # 1) Guardar .ots temporal
         ots_path = td / (ots_file.filename or "proof.ots")
         ots_bytes = await ots_file.read()
         ots_path.write_bytes(ots_bytes)
 
-        # Si viene el archivo original, guardarlo con su nombre para que el CLI lo encuentre automáticamente
+        # 2) Si viene el archivo original, guardarlo (no importa el nombre)
         file_hash = None
+        target_path: Optional[Path] = None
         if target_file is not None:
             target_bytes = await target_file.read()
             if target_bytes:
-                (td / (target_file.filename or "target.bin")).write_bytes(target_bytes)
+                target_path = td / (target_file.filename or "target.bin")
+                target_path.write_bytes(target_bytes)
                 file_hash = _sha256_bytes(target_bytes)
 
-        result = _run_ots_verify(ots_path)
+        # 3) Verificar pasando explícitamente el original (si lo tenemos)
+        result = _run_ots_verify(ots_path, target_path)
 
-        # Guardar {file_hash}.ots si lo pidieron y tenemos hash del original
+        # 4) Guardar {file_hash}.ots si lo pidieron y tenemos hash del original
         saved_as = None
         if save and file_hash:
             dest = PROOFS_DIR / f"{file_hash}.ots"
@@ -436,7 +444,7 @@ async def verify_by_hash(file_hash: str):
             "detail": f"No local proof found for {file_hash}. Colocá '{file_hash}.ots' en {PROOFS_DIR} o subí vía /verify-ots?save=1.",
         })
 
-    # 1) Intento de verificación de contenido (sin original puede fallar)
+    # 1) Intento de verificación de contenido (con original es más preciso; sin original puede no validar contenido)
     result = _run_ots_verify(candidate)
     if result["status"] == "verified":
         return {
@@ -449,7 +457,7 @@ async def verify_by_hash(file_hash: str):
             "used_proof": str(candidate),
         }
 
-    # 2) Sin original: devolvemos ESTADO ejecutando 'upgrade' (status only)
+    # 2) Sin original: estado usando 'upgrade'
     up = _run_ots_upgrade(candidate)
     return {
         "ok": (up["status"] == "verified"),
