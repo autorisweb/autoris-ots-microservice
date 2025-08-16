@@ -13,18 +13,18 @@ from fastapi.middleware.cors import CORSMiddleware
 
 APP_NAME = "autoris-ots-microservice"
 
-# Directorio donde se guardan las pruebas persistentes
+# Carpeta de pruebas persistentes
 PROOFS_DIR = Path(os.getenv("PROOFS_DIR", "./proofs")).resolve()
 PROOFS_DIR.mkdir(parents=True, exist_ok=True)
 
-# Flags del CLI (podés cambiarlos por env). IMPORTANTE: van ANTES del subcomando.
-# --no-bitcoin en verify evita que requiera bitcoind local; muestra estado (pending/complete).
+# Flags globales para el CLI (van ANTES del subcomando)
+# --no-bitcoin: no requiere bitcoind; sirve para ver estado pending/complete
 OTS_VERIFY_ARGS = os.getenv("OTS_VERIFY_ARGS", "--no-bitcoin").split()
 OTS_UPGRADE_ARGS = os.getenv("OTS_UPGRADE_ARGS", "").split()
 
 app = FastAPI(title=f"{APP_NAME}")
 
-# CORS abierto (ajustá si querés restringir)
+# CORS abierto (ajustar si querés restringir)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -53,7 +53,7 @@ def _run(cmd: list[str]) -> dict:
     }
 
 def _status_from_text(text: str) -> str:
-    t = text.lower()
+    t = (text or "").lower()
     if "timestamp complete" in t or "attestation verified" in t or ("success!" in t and "complete" in t):
         return "verified"
     if "pending" in t or "pending confirmation" in t or "not enough confirmations" in t:
@@ -62,32 +62,37 @@ def _status_from_text(text: str) -> str:
         return "failed"
     return "unknown"
 
-def _run_ots_verify(ots_path: Path, target_path: Optional[Path] = None) -> dict:
+def _run_ots_verify(ots_path: Path, *, target_path: Optional[Path] = None, digest_hex: Optional[str] = None) -> dict:
     """
-    Ejecuta `ots verify <proof.ots> [target]`
-    Pasamos el archivo original explícitamente si está disponible (robusto ante nombres raros).
+    Ejecuta `ots verify` correctamente:
+      - con archivo original:  ots [global] verify -f <original> <proof.ots>
+      - con digest SHA-256:    ots [global] verify -d <sha256>   <proof.ots>
+      - sólo prueba .ots:      ots [global] verify               <proof.ots>
     """
-    cmd = ["ots", *OTS_VERIFY_ARGS, "verify", str(ots_path)]
+    cmd = ["ots", *OTS_VERIFY_ARGS, "verify"]
     if target_path is not None:
-        cmd.append(str(target_path))
-    r = _run(cmd)
-    text = (r["stdout"] + "\n" + r["stderr"]).lower()
+        cmd += ["-f", str(target_path)]
+    if digest_hex is not None:
+        cmd += ["-d", digest_hex]
+    cmd += [str(ots_path)]
 
-    # Heurística/estado
-    if ("bitcoin block" in text) or ("attestation verified" in text) or ("pending confirmation" in text) or ("got" in text and "attestation" in text):
-        r["ok"] = True
+    r = _run(cmd)
+    text = (r["stdout"] + "\n" + r["stderr"])
     r["status"] = _status_from_text(text)
+    # Heurística de ok (cuando hay pending con --no-bitcoin el rc puede ser 1)
+    if ("bitcoin block" in text.lower()) or ("attestation verified" in text.lower()) or ("pending confirmation" in text.lower()):
+        r["ok"] = True
     return r
 
 def _run_ots_upgrade(ots_path: Path) -> dict:
     cmd = ["ots", *OTS_UPGRADE_ARGS, "upgrade", str(ots_path)]
     r = _run(cmd)
-    text = (r["stdout"] + "\n" + r["stderr"]).lower()
+    text = (r["stdout"] + "\n" + r["stderr"])
     r["status"] = _status_from_text(text)
     return r
 
 def _run_ots_stamp(target_path: Path) -> dict:
-    """Ejecuta `ots stamp <archivo>`, que genera <archivo>.ots junto al original."""
+    """`ots stamp <archivo>` -> genera <archivo>.ots junto al original"""
     cmd = ["ots", "stamp", str(target_path)]
     return _run(cmd)
 
@@ -99,7 +104,6 @@ async def health():
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    # UI mínima para pruebas manuales
     return """
     <!doctype html><html lang="es"><head>
     <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -238,20 +242,13 @@ async def hash_file(file: UploadFile = File(...)):
     data = await file.read()
     return {"filename": file.filename, "sha256": _sha256_bytes(data), "size": len(data)}
 
-# -------- STAMP: PDF/archivo -> OTS --------
+# -------- STAMP: archivo -> OTS --------
 @app.post("/stamp-file")
 async def stamp_file(
     file: UploadFile = File(...),
     save: int = Query(1, description="Si =1, guarda {file_hash}.ots en PROOFS_DIR"),
     download: int = Query(0, description="Si =1, devuelve la .ots como attachment en vez de JSON"),
 ):
-    """
-    Recibe un archivo (ej: el PDF del certificado), crea su prueba OTS,
-    y devuelve:
-      - JSON con {file_hash, proof_b64, ots_size} (por defecto), o
-      - attachment .ots si download=1.
-    Si save=1, también guarda {file_hash}.ots en PROOFS_DIR.
-    """
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
         target_path = td / (file.filename or "target.bin")
@@ -273,14 +270,13 @@ async def stamp_file(
         proof_bytes = proof_path.read_bytes()
         file_hash = _sha256_bytes(data)
 
-        # Guardado opcional {file_hash}.ots en PROOFS_DIR
+        # Guardado opcional {file_hash}.ots
         saved_as = None
         if save:
             dest = PROOFS_DIR / f"{file_hash}.ots"
             dest.write_bytes(proof_bytes)
             saved_as = str(dest)
 
-        # Respuesta binaria (descarga)
         if download:
             return StreamingResponse(
                 iter([proof_bytes]),
@@ -292,13 +288,12 @@ async def stamp_file(
                 },
             )
 
-        # JSON: base64 ESTÁNDAR con padding
         proof_b64 = base64.b64encode(proof_bytes).decode("ascii")
         return {
             "ok": True,
             "file_hash": file_hash,
             "ots_size": len(proof_bytes),
-            "proof_b64": proof_b64,   # estándar + padding
+            "proof_b64": proof_b64,
             "saved_as": saved_as,
             "returncode": r["returncode"],
             "stdout": r["stdout"],
@@ -306,7 +301,7 @@ async def stamp_file(
             "status": "pending",
         }
 
-# Atajo: devuelve SIEMPRE la .ots en binario
+# Atajo: siempre devuelve binario
 @app.post("/stamp-file.raw")
 async def stamp_file_raw(
     file: UploadFile = File(...),
@@ -347,14 +342,14 @@ async def verify_ots(
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
 
-        # 1) Guardar .ots temporal
+        # Guardar .ots temporal
         ots_path = td / (ots_file.filename or "proof.ots")
         ots_bytes = await ots_file.read()
         ots_path.write_bytes(ots_bytes)
 
-        # 2) Si viene el archivo original, guardarlo (no importa el nombre)
+        # Si envían el original, guardarlo y usar -f
         file_hash = None
-        target_path: Optional[Path] = None
+        target_path = None
         if target_file is not None:
             target_bytes = await target_file.read()
             if target_bytes:
@@ -362,10 +357,15 @@ async def verify_ots(
                 target_path.write_bytes(target_bytes)
                 file_hash = _sha256_bytes(target_bytes)
 
-        # 3) Verificar pasando explícitamente el original (si lo tenemos)
-        result = _run_ots_verify(ots_path, target_path)
+        # Si no hay original pero el nombre del .ots es un SHA-256, usar -d <hash>
+        digest_hex = None
+        stem = ots_path.stem.lower()
+        if digest_hex is None and HEX64_RE.match(stem):
+            digest_hex = stem
 
-        # 4) Guardar {file_hash}.ots si lo pidieron y tenemos hash del original
+        result = _run_ots_verify(ots_path, target_path=target_path, digest_hex=digest_hex)
+
+        # Guardar {file_hash}.ots si lo piden y TENEMOS hash del original
         saved_as = None
         if save and file_hash:
             dest = PROOFS_DIR / f"{file_hash}.ots"
@@ -378,7 +378,7 @@ async def verify_ots(
             "returncode": result["returncode"],
             "stdout": result["stdout"],
             "stderr": result["stderr"],
-            "file_hash": file_hash,
+            "file_hash": file_hash or digest_hex,
             "saved_as": saved_as,
         }
 
@@ -398,7 +398,6 @@ async def upgrade_ots(
         upgraded = ots_path.read_bytes()
         filename = ots_file.filename or "proof.ots"
 
-        # Guardado opcional en servidor
         saved_as = None
         if save:
             out_name = filename
@@ -408,7 +407,6 @@ async def upgrade_ots(
             dest.write_bytes(upgraded)
             saved_as = str(dest)
 
-        # Si aún está pending, devolvemos JSON
         if r["status"] != "verified":
             return {
                 "ok": False,
@@ -420,7 +418,6 @@ async def upgrade_ots(
                 "saved_as": saved_as,
             }
 
-        # Si mejoró OK, devolvemos archivo como descarga
         return StreamingResponse(
             iter([upgraded]),
             media_type="application/octet-stream",
@@ -444,8 +441,8 @@ async def verify_by_hash(file_hash: str):
             "detail": f"No local proof found for {file_hash}. Colocá '{file_hash}.ots' en {PROOFS_DIR} o subí vía /verify-ots?save=1.",
         })
 
-    # 1) Intento de verificación de contenido (con original es más preciso; sin original puede no validar contenido)
-    result = _run_ots_verify(candidate)
+    # 1) Intento de verificación de contenido
+    result = _run_ots_verify(candidate, digest_hex=file_hash)
     if result["status"] == "verified":
         return {
             "ok": True,
@@ -457,7 +454,7 @@ async def verify_by_hash(file_hash: str):
             "used_proof": str(candidate),
         }
 
-    # 2) Sin original: estado usando 'upgrade'
+    # 2) Sólo estado con upgrade
     up = _run_ots_upgrade(candidate)
     return {
         "ok": (up["status"] == "verified"),
