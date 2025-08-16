@@ -62,17 +62,26 @@ def _status_from_text(text: str) -> str:
         return "failed"
     return "unknown"
 
-def _run_ots_verify(ots_path: Path, *, target_path: Optional[Path] = None, digest_hex: Optional[str] = None) -> dict:
+def _run_ots_verify(
+    ots_path: Path,
+    *,
+    target_path: Optional[Path] = None,
+    digest_hex: Optional[str] = None
+) -> dict:
     """
     Ejecuta `ots verify` correctamente:
       - con archivo original:  ots [global] verify -f <original> <proof.ots>
       - con digest SHA-256:    ots [global] verify -d <sha256>   <proof.ots>
       - sólo prueba .ots:      ots [global] verify               <proof.ots>
     """
+    # Si hay original, por contrato del CLI no debemos pasar -d
+    if target_path is not None:
+        digest_hex = None
+
     cmd = ["ots", *OTS_VERIFY_ARGS, "verify"]
     if target_path is not None:
         cmd += ["-f", str(target_path)]
-    if digest_hex is not None:
+    elif digest_hex is not None:
         cmd += ["-d", digest_hex]
     cmd += [str(ots_path)]
 
@@ -357,11 +366,12 @@ async def verify_ots(
                 target_path.write_bytes(target_bytes)
                 file_hash = _sha256_bytes(target_bytes)
 
-        # Si no hay original pero el nombre del .ots es un SHA-256, usar -d <hash>
+        # Si NO hay original pero el nombre del .ots es un SHA-256, usar -d <hash>
         digest_hex = None
-        stem = ots_path.stem.lower()
-        if digest_hex is None and HEX64_RE.match(stem):
-            digest_hex = stem
+        if target_path is None:
+            stem = ots_path.stem.lower()
+            if HEX64_RE.match(stem):
+                digest_hex = stem
 
         result = _run_ots_verify(ots_path, target_path=target_path, digest_hex=digest_hex)
 
@@ -441,13 +451,13 @@ async def verify_by_hash(file_hash: str):
             "detail": f"No local proof found for {file_hash}. Colocá '{file_hash}.ots' en {PROOFS_DIR} o subí vía /verify-ots?save=1.",
         })
 
-    # 1) Intento de verificación de contenido
+    # 1) Intento de verificación (sin original usa -d <hash>)
     result = _run_ots_verify(candidate, digest_hex=file_hash)
     if result["status"] == "verified":
         return {
             "ok": True,
             "status": "verified",
-            "mode": "content_verify",
+            "mode": "content_or_digest_verify",
             "returncode": result["returncode"],
             "stdout": result["stdout"],
             "stderr": result["stderr"],
